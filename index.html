@@ -319,17 +319,53 @@
     return (parseFloat(ing.purchasePrice)||0) / baseQty;
   }
 
-  function computeProductCost(product){
+  function productById(id){
+    return state.products.find(function(p){ return p.id === id; });
+  }
+
+  // Does `productId`, following its own product-type components, ever reach `targetId`?
+  // Used to keep a product from including itself directly or through a chain of other products.
+  function productDependsOn(productId, targetId, seen){
+    seen = seen || {};
+    if(seen[productId]) return false;
+    seen[productId] = true;
+    var p = productById(productId);
+    if(!p) return false;
+    return (p.items||[]).some(function(item){
+      if((item.kind || 'ingredient') !== 'product') return false;
+      if(item.productId === targetId) return true;
+      return productDependsOn(item.productId, targetId, seen);
+    });
+  }
+
+  function computeProductCost(product, chain){
+    chain = chain || [];
     var total = 0;
     var lines = [];
+    if(chain.indexOf(product.id) !== -1){
+      // Circular reference (A uses B uses A) — stop here instead of looping forever.
+      return { total: 0, lines: [], circular: true };
+    }
+    var nextChain = chain.concat([product.id]);
     (product.items||[]).forEach(function(item){
-      var ing = ingredientById(item.ingredientId);
-      if(!ing){ return; }
-      var baseQty = toBase(item.qty, item.unit);
-      var perBase = pricePerBase(ing);
-      var cost = baseQty * perBase;
-      total += cost;
-      lines.push({ ing:ing, qty:item.qty, unit:item.unit, cost:cost });
+      var kind = item.kind || 'ingredient';
+      if(kind === 'product'){
+        var refProduct = productById(item.productId);
+        if(!refProduct){ return; }
+        var qty = parseFloat(item.qty) || 0;
+        var sub = computeProductCost(refProduct, nextChain);
+        var cost = qty * sub.total;
+        total += cost;
+        lines.push({ kind:'product', product:refProduct, qty:qty, cost:cost, circular: !!sub.circular });
+      } else {
+        var ing = ingredientById(item.ingredientId);
+        if(!ing){ return; }
+        var baseQty = toBase(item.qty, item.unit);
+        var perBase = pricePerBase(ing);
+        var cost = baseQty * perBase;
+        total += cost;
+        lines.push({ kind:'ingredient', ing:ing, qty:item.qty, unit:item.unit, cost:cost });
+      }
     });
     return { total: total, lines: lines };
   }
@@ -437,7 +473,7 @@
     state.products.forEach(function(p){
       var costData = computeProductCost(p);
       var pricing = computePricing(p, costData.total);
-      var names = costData.lines.map(function(l){ return l.ing.name; });
+      var names = costData.lines.map(function(l){ return l.kind === 'product' ? l.product.name : l.ing.name; });
       var namesText = names.slice(0,3).join(', ') + (names.length>3 ? ' +'+(names.length-3)+' más' : '');
       if(names.length===0) namesText = 'Sin ingredientes cargados';
       out += '<div class="card" data-action="open-product-detail" data-id="'+p.id+'">'
@@ -619,9 +655,13 @@
       +     '</div>'
       +   '</div>'
       +   '<div>'
-      +     '<div class="section-label">Ingredientes</div>'
+      +     '<div class="section-label">Ingredientes y productos</div>'
+      +     '<div class="helper" style="margin-bottom:8px;">Un producto ya cargado también se puede usar como componente de otro — por ejemplo, una milanesa adentro de un sándwich de milanesa. Se toma el costo de producción de ese producto, no su precio de venta.</div>'
       +     '<div id="prod-ing-rows" style="display:flex;flex-direction:column;gap:8px;"></div>'
-      +     '<button type="button" class="btn btn-outline btn-sm" style="margin-top:8px;" id="add-ing-row">+ Agregar ingrediente</button>'
+      +     '<div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:8px;">'
+      +       '<button type="button" class="btn btn-outline btn-sm" id="add-ing-row">+ Agregar ingrediente</button>'
+      +       '<button type="button" class="btn btn-outline btn-sm" id="add-product-row">+ Agregar producto</button>'
+      +     '</div>'
       +   '</div>'
       +   '<div class="cost-summary"><span class="label">Costo total</span><span class="value" id="cost-total-display">'+money(costData.total)+'</span></div>'
       +   '<div>'
@@ -647,15 +687,35 @@
       + '</div>';
   }
 
-  function computeProductCostFromDraft(items){
+  function availableProductsFor(editingId){
+    return state.products.filter(function(p){
+      if(editingId && p.id === editingId) return false;
+      if(editingId && productDependsOn(p.id, editingId)) return false;
+      return true;
+    });
+  }
+
+  function computeProductCostFromDraft(items, editingId){
     var total = 0; var lines = [];
+    var chain = editingId ? [editingId] : [];
     items.forEach(function(item){
-      var ing = ingredientById(item.ingredientId);
-      if(!ing) return;
-      var baseQty = toBase(item.qty, item.unit);
-      var cost = baseQty * pricePerBase(ing);
-      total += cost;
-      lines.push({ing:ing, cost:cost});
+      var kind = item.kind || 'ingredient';
+      if(kind === 'product'){
+        var refProduct = productById(item.productId);
+        if(!refProduct) return;
+        var qty = parseFloat(item.qty) || 0;
+        var sub = computeProductCost(refProduct, chain);
+        var cost = qty * sub.total;
+        total += cost;
+        lines.push({kind:'product', product:refProduct, cost:cost});
+      } else {
+        var ing = ingredientById(item.ingredientId);
+        if(!ing) return;
+        var baseQty = toBase(item.qty, item.unit);
+        var cost = baseQty * pricePerBase(ing);
+        total += cost;
+        lines.push({kind:'ingredient', ing:ing, cost:cost});
+      }
     });
     return {total:total, lines:lines};
   }
@@ -676,32 +736,54 @@
   function renderIngRows(draft){
     var container = document.getElementById('prod-ing-rows');
     if(!container) return;
-    if(state.ingredients.length === 0){
-      container.innerHTML = '<div class="helper">No tenés ingredientes cargados todavía. Cerrá este formulario y agregá ingredientes primero desde la pestaña "Ingredientes".</div>';
+    if(draft.items.length === 0){
+      container.innerHTML = '<div class="helper">Todavía no agregaste ingredientes ni productos a este producto.</div>';
       return;
     }
+    var availProducts = availableProductsFor(draft.id);
+    var chain = draft.id ? [draft.id] : [];
     container.innerHTML = draft.items.map(function(item, idx){
-      var ing = ingredientById(item.ingredientId);
-      var tipo = ing ? ing.tipo : 'peso';
-      var units = unitsForTipo(tipo);
-      var cost = 0;
-      if(ing){ cost = toBase(item.qty, item.unit) * pricePerBase(ing); }
-      return '<div class="prod-ing-row" data-row="'+idx+'">'
-        + '<div class="field ingredient-field"><label>Ingrediente</label><select class="row-ingredient" data-row="'+idx+'">'
-        +   state.ingredients.map(function(i){ return '<option value="'+i.id+'" '+(i.id===item.ingredientId?'selected':'')+'>'+escapeHtml(i.name)+'</option>'; }).join('')
-        + '</select></div>'
-        + '<div class="field qty-field"><label>Cant.</label><input type="number" min="0" step="any" class="row-qty" data-row="'+idx+'" value="'+(item.qty!=null?item.qty:'')+'"></div>'
-        + '<div class="field unit-field"><label>Unidad</label><select class="row-unit" data-row="'+idx+'">'
-        +   units.map(function(u){ return '<option value="'+u+'" '+(item.unit===u?'selected':'')+'>'+u+'</option>'; }).join('')
-        + '</select></div>'
-        + '<div class="cost-tag">'+money(cost)+'</div>'
-        + '<button type="button" class="remove-row" data-remove-row="'+idx+'">&times;</button>'
-        + '</div>';
+      var kind = item.kind || 'ingredient';
+      if(kind === 'product'){
+        var refProduct = productById(item.productId);
+        var cost = refProduct ? (parseFloat(item.qty)||0) * computeProductCost(refProduct, chain).total : 0;
+        var optionsHtml = availProducts.length
+          ? availProducts.map(function(p){ return '<option value="'+p.id+'" '+(p.id===item.productId?'selected':'')+'>'+escapeHtml(p.name)+'</option>'; }).join('')
+          : '<option value="">(no hay productos disponibles)</option>';
+        return '<div class="prod-ing-row" data-row="'+idx+'">'
+          + '<div class="field ingredient-field"><label>Producto</label><select class="row-product" data-row="'+idx+'">'
+          +   optionsHtml
+          + '</select></div>'
+          + '<div class="field qty-field"><label>Cant.</label><input type="number" min="0" step="any" class="row-qty" data-row="'+idx+'" value="'+(item.qty!=null?item.qty:'')+'"></div>'
+          + '<div class="cost-tag">'+money(cost)+'</div>'
+          + '<button type="button" class="remove-row" data-remove-row="'+idx+'">&times;</button>'
+          + '</div>';
+      } else {
+        var ing = ingredientById(item.ingredientId);
+        var tipo = ing ? ing.tipo : 'peso';
+        var units = unitsForTipo(tipo);
+        var cost = 0;
+        if(ing){ cost = toBase(item.qty, item.unit) * pricePerBase(ing); }
+        var ingOptionsHtml = state.ingredients.length
+          ? state.ingredients.map(function(i){ return '<option value="'+i.id+'" '+(i.id===item.ingredientId?'selected':'')+'>'+escapeHtml(i.name)+'</option>'; }).join('')
+          : '<option value="">(no hay ingredientes)</option>';
+        return '<div class="prod-ing-row" data-row="'+idx+'">'
+          + '<div class="field ingredient-field"><label>Ingrediente</label><select class="row-ingredient" data-row="'+idx+'">'
+          +   ingOptionsHtml
+          + '</select></div>'
+          + '<div class="field qty-field"><label>Cant.</label><input type="number" min="0" step="any" class="row-qty" data-row="'+idx+'" value="'+(item.qty!=null?item.qty:'')+'"></div>'
+          + '<div class="field unit-field"><label>Unidad</label><select class="row-unit" data-row="'+idx+'">'
+          +   units.map(function(u){ return '<option value="'+u+'" '+(item.unit===u?'selected':'')+'>'+u+'</option>'; }).join('')
+          + '</select></div>'
+          + '<div class="cost-tag">'+money(cost)+'</div>'
+          + '<button type="button" class="remove-row" data-remove-row="'+idx+'">&times;</button>'
+          + '</div>';
+      }
     }).join('');
   }
 
   function refreshProductLiveCalc(draft){
-    var costData = computeProductCostFromDraft(draft.items);
+    var costData = computeProductCostFromDraft(draft.items, draft.id);
     document.getElementById('cost-total-display').textContent = money(costData.total);
     var pricing = computePricingFromValue(draft.pricingMode, draft.pricingValue, costData.total);
     var resultLabel = document.getElementById('result-label');
@@ -714,13 +796,21 @@
       resultValue.textContent = pricing.marginPct.toFixed(1)+'%';
     }
     // update row cost tags without full re-render (preserve focus)
+    var chain = draft.id ? [draft.id] : [];
     var rows = document.querySelectorAll('.prod-ing-row');
     rows.forEach(function(row){
       var idx = parseInt(row.getAttribute('data-row'),10);
       var item = draft.items[idx];
       if(!item) return;
-      var ing = ingredientById(item.ingredientId);
-      var cost = ing ? toBase(item.qty, item.unit) * pricePerBase(ing) : 0;
+      var kind = item.kind || 'ingredient';
+      var cost = 0;
+      if(kind === 'product'){
+        var refProduct = productById(item.productId);
+        if(refProduct){ cost = (parseFloat(item.qty)||0) * computeProductCost(refProduct, chain).total; }
+      } else {
+        var ing = ingredientById(item.ingredientId);
+        cost = ing ? toBase(item.qty, item.unit) * pricePerBase(ing) : 0;
+      }
       row.querySelector('.cost-tag').textContent = money(cost);
     });
   }
@@ -729,14 +819,23 @@
     var draft = data; // mutated in place while modal open
     if(!draft.items) draft.items = [];
     if(draft.items.length === 0 && state.ingredients.length > 0){
-      draft.items.push({ ingredientId: state.ingredients[0].id, qty:'', unit: unitsForTipo(state.ingredients[0].tipo)[0] });
+      draft.items.push({ kind:'ingredient', ingredientId: state.ingredients[0].id, qty:'', unit: unitsForTipo(state.ingredients[0].tipo)[0] });
     }
     renderIngRows(draft);
     refreshProductLiveCalc(draft);
 
     document.getElementById('add-ing-row').addEventListener('click', function(){
-      if(state.ingredients.length === 0) return;
-      draft.items.push({ ingredientId: state.ingredients[0].id, qty:'', unit: unitsForTipo(state.ingredients[0].tipo)[0] });
+      if(state.ingredients.length === 0){ alert('Primero cargá algún ingrediente desde la pestaña "Ingredientes".'); return; }
+      draft.items.push({ kind:'ingredient', ingredientId: state.ingredients[0].id, qty:'', unit: unitsForTipo(state.ingredients[0].tipo)[0] });
+      renderIngRows(draft);
+      refreshProductLiveCalc(draft);
+      bindRowEvents(draft);
+    });
+
+    document.getElementById('add-product-row').addEventListener('click', function(){
+      var avail = availableProductsFor(draft.id);
+      if(avail.length === 0){ alert('No tenés otro producto disponible para usar como componente todavía.'); return; }
+      draft.items.push({ kind:'product', productId: avail[0].id, qty:'' });
       renderIngRows(draft);
       refreshProductLiveCalc(draft);
       bindRowEvents(draft);
@@ -759,6 +858,15 @@
           var ing = ingredientById(sel.value);
           draft.items[idx].ingredientId = sel.value;
           draft.items[idx].unit = unitsForTipo(ing.tipo)[0];
+          renderIngRows(draft);
+          refreshProductLiveCalc(draft);
+          bindRowEvents();
+        };
+      });
+      document.querySelectorAll('.row-product').forEach(function(sel){
+        sel.onchange = function(){
+          var idx = parseInt(sel.getAttribute('data-row'),10);
+          draft.items[idx].productId = sel.value;
           renderIngRows(draft);
           refreshProductLiveCalc(draft);
           bindRowEvents();
@@ -836,7 +944,11 @@
     var name = document.getElementById('prod-name').value.trim();
     if(!name){ alert('Ponele un nombre al producto.'); return; }
     var description = document.getElementById('prod-desc').value.trim();
-    var items = draft.items.filter(function(it){ return it.ingredientId && parseFloat(it.qty) > 0; });
+    var items = draft.items.filter(function(it){
+      var kind = it.kind || 'ingredient';
+      if(kind === 'product') return it.productId && parseFloat(it.qty) > 0;
+      return it.ingredientId && parseFloat(it.qty) > 0;
+    });
     var product = {
       id: id || uid(),
       name: name,
@@ -867,11 +979,15 @@
       +   (product.photo ? '<div class="detail-photo"><img src="'+product.photo+'"></div>' : '')
       +   (product.description ? '<div class="helper" style="font-size:14px;color:var(--ink);">'+escapeHtml(product.description)+'</div>' : '')
       +   '<div>'
-      +     '<div class="section-label">Ingredientes</div>'
+      +     '<div class="section-label">Ingredientes y productos</div>'
       +     '<div class="detail-ing-list">'
       +       (costData.lines.length ? costData.lines.map(function(l){
+                if(l.kind === 'product'){
+                  return '<div class="detail-ing-item"><span class="qname">'+escapeHtml(l.product.name)+' <span class="qamt">(x'+l.qty+', producto)</span></span><span class="qcost">'+money(l.cost)+'</span></div>'
+                    + (l.circular ? '<div class="helper" style="color:var(--rust);padding:0 0 6px;">⚠ Referencia circular: revisá los componentes de este producto.</div>' : '');
+                }
                 return '<div class="detail-ing-item"><span class="qname">'+escapeHtml(l.ing.name)+' <span class="qamt">('+l.qty+' '+l.unit+')</span></span><span class="qcost">'+money(l.cost)+'</span></div>';
-              }).join('') : '<div class="helper" style="padding:10px 0;">Sin ingredientes cargados.</div>')
+              }).join('') : '<div class="helper" style="padding:10px 0;">Sin ingredientes ni productos cargados.</div>')
       +     '</div>'
       +   '</div>'
       +   '<div class="cost-summary"><span class="label">Costo total</span><span class="value">'+money(costData.total)+'</span></div>'
@@ -935,7 +1051,13 @@
         render();
       }
       else if(action === 'delete-product'){
-        if(confirm('¿Eliminar este producto?')){
+        var usedBy = state.products.filter(function(p){
+          return p.id !== id && (p.items||[]).some(function(it){ return (it.kind||'ingredient') === 'product' && it.productId === id; });
+        });
+        var msg = usedBy.length
+          ? '¿Eliminar este producto? Otros productos lo usan como componente (' + usedBy.map(function(p){return p.name;}).join(', ') + ') y van a quedar con ese ítem sin efecto.'
+          : '¿Eliminar este producto?';
+        if(confirm(msg)){
           state.products = state.products.filter(function(p){ return p.id !== id; });
           saveState(); closeModal();
         }
