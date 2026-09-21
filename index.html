@@ -257,6 +257,9 @@
   var state = loadState();
   if(!state.view) state.view = "productos";
   state.modal = null;
+  if(state.productSearch == null) state.productSearch = "";
+  if(state.productCategoryFilter == null) state.productCategoryFilter = "";
+  if(state.ingredientSearch == null) state.ingredientSearch = "";
 
   function loadState(){
     try{
@@ -367,6 +370,12 @@
         lines.push({ kind:'ingredient', ing:ing, qty:item.qty, unit:item.unit, cost:cost });
       }
     });
+    (product.extraCosts||[]).forEach(function(ec){
+      var amt = parseFloat(ec.amount) || 0;
+      if(amt <= 0) return;
+      total += amt;
+      lines.push({ kind:'extra', name: ec.name || '', cost: amt });
+    });
     return { total: total, lines: lines };
   }
 
@@ -456,24 +465,31 @@
     input.addEventListener('keydown', function(e){ if(e.key === 'Enter') submit(); });
   }
 
-  function renderProductsView(){
-    var out = '<div class="toolbar">'
-      + '<div class="hint">Cada producto suma el costo de sus ingredientes. Definí el margen o el precio de venta y se calcula solo — si después cambia el precio de un ingrediente, se actualiza acá.</div>'
-      + '</div>';
+  function uniqueCategories(){
+    var set = {};
+    state.products.forEach(function(p){ if(p.category) set[p.category] = true; });
+    return Object.keys(set).sort();
+  }
 
-    if(state.products.length === 0 && state.ingredients.length === 0){
-      out += '<div class="empty"><div class="big">Todavía no cargaste nada</div>'
-        + 'Primero cargá algunos ingredientes con su precio, y después armá tu primer producto.<br><br>'
-        + '<button class="btn btn-primary" data-action="open-ingredient-modal">Cargar un ingrediente</button>'
-        + '</div>';
-      return out;
+  function filteredProductsList(){
+    return state.products.filter(function(p){
+      var matchesSearch = !state.productSearch || p.name.toLowerCase().indexOf(state.productSearch.toLowerCase()) !== -1;
+      var matchesCategory = !state.productCategoryFilter || p.category === state.productCategoryFilter;
+      return matchesSearch && matchesCategory;
+    });
+  }
+
+  function renderProductsGridHtml(){
+    var filtered = filteredProductsList();
+    var out = '';
+    if(state.products.length > 0 && filtered.length === 0){
+      out += '<div class="empty" style="padding:30px 20px;"><div class="big" style="font-size:17px;">No se encontraron productos</div>Probá con otra búsqueda o categoría.</div>';
     }
-
     out += '<div class="grid">';
-    state.products.forEach(function(p){
+    filtered.forEach(function(p){
       var costData = computeProductCost(p);
       var pricing = computePricing(p, costData.total);
-      var names = costData.lines.map(function(l){ return l.kind === 'product' ? l.product.name : l.ing.name; });
+      var names = costData.lines.filter(function(l){ return l.kind !== 'extra'; }).map(function(l){ return l.kind === 'product' ? l.product.name : l.ing.name; });
       var namesText = names.slice(0,3).join(', ') + (names.length>3 ? ' +'+(names.length-3)+' más' : '');
       if(names.length===0) namesText = 'Sin ingredientes cargados';
       out += '<div class="card" data-action="open-product-detail" data-id="'+p.id+'">'
@@ -481,6 +497,7 @@
         +   (p.photo ? '<img src="'+p.photo+'" alt="">' : '<span class="placeholder">🍽️</span>')
         + '</div>'
         + '<div class="card-body">'
+        +   (p.category ? '<span class="ing-tag" style="align-self:flex-start;">'+escapeHtml(p.category)+'</span>' : '')
         +   '<div class="card-title">'+escapeHtml(p.name)+'</div>'
         +   (p.description ? '<div class="card-ingredients" style="color:var(--ink);font-weight:500;">'+escapeHtml(p.description)+'</div>' : '')
         +   '<div class="card-ingredients">'+escapeHtml(namesText)+'</div>'
@@ -498,6 +515,65 @@
     return out;
   }
 
+  function renderProductsView(){
+    var out = '<div class="toolbar">'
+      + '<div class="hint">Cada producto suma el costo de sus ingredientes. Definí el margen o el precio de venta y se calcula solo — si después cambia el precio de un ingrediente, se actualiza acá.</div>'
+      + '</div>';
+
+    if(state.products.length === 0 && state.ingredients.length === 0){
+      out += '<div class="empty"><div class="big">Todavía no cargaste nada</div>'
+        + 'Primero cargá algunos ingredientes con su precio, y después armá tu primer producto.<br><br>'
+        + '<button class="btn btn-primary" data-action="open-ingredient-modal">Cargar un ingrediente</button>'
+        + '</div>';
+      return out;
+    }
+
+    var cats = uniqueCategories();
+    out += '<div class="toolbar" style="margin-bottom:14px;">'
+      + '<input type="text" id="product-search" placeholder="Buscar productos..." value="'+escapeHtml(state.productSearch||'')+'" style="flex:1;min-width:160px;border:1px solid var(--line);border-radius:9px;padding:9px 12px;font-size:14px;background:#FCFBF7;">'
+      + (cats.length ? ('<select id="product-category-filter" style="border:1px solid var(--line);border-radius:9px;padding:9px 12px;font-size:14px;background:#FCFBF7;">'
+          + '<option value="">Todas las categorías</option>'
+          + cats.map(function(c){ return '<option value="'+escapeHtml(c)+'" '+(state.productCategoryFilter===c?'selected':'')+'>'+escapeHtml(c)+'</option>'; }).join('')
+          + '</select>') : '')
+      + '</div>';
+
+    out += '<div id="products-grid-container">' + renderProductsGridHtml() + '</div>';
+    return out;
+  }
+
+  function filteredIngredientsList(){
+    return state.ingredients.filter(function(ing){
+      return !state.ingredientSearch || ing.name.toLowerCase().indexOf(state.ingredientSearch.toLowerCase()) !== -1;
+    });
+  }
+
+  function renderIngredientRowHtml(ing){
+    var perBase = pricePerBase(ing);
+    var tipoLabel = ing.tipo === 'peso' ? 'Peso' : (ing.tipo === 'volumen' ? 'Volumen' : 'Unidad');
+    var perBaseLabel = ing.tipo === 'peso' ? '/g' : (ing.tipo === 'volumen' ? '/ml' : '/u');
+    return '<div class="ing-row">'
+      + '<span class="ing-tag">'+tipoLabel+'</span>'
+      + '<span class="ing-name">'+escapeHtml(ing.name)+'</span>'
+      + '<span class="ing-meta">'+money(ing.purchasePrice)+' cada '+ing.purchaseQty+' '+ing.purchaseUnit+'</span>'
+      + '<span class="ing-unit-price">'+money(perBase)+perBaseLabel+'</span>'
+      + '<span class="row-actions">'
+      +   '<button class="btn btn-ghost btn-sm" data-action="edit-ingredient" data-id="'+ing.id+'">Editar</button>'
+      +   '<button class="btn btn-danger btn-sm" data-action="delete-ingredient" data-id="'+ing.id+'">Eliminar</button>'
+      + '</span>'
+      + '</div>';
+  }
+
+  function renderIngredientsListHtml(){
+    var filtered = filteredIngredientsList();
+    if(state.ingredients.length > 0 && filtered.length === 0){
+      return '<div class="empty" style="padding:30px 20px;"><div class="big" style="font-size:17px;">No se encontraron ingredientes</div>Probá con otra búsqueda.</div>';
+    }
+    var out = '<div class="ing-list">';
+    filtered.forEach(function(ing){ out += renderIngredientRowHtml(ing); });
+    out += '</div>';
+    return out;
+  }
+
   function renderIngredientsView(){
     var out = '<div class="toolbar">'
       + '<div class="hint">Cargá cada ingrediente con el precio al que lo comprás. Si sube el precio, editalo acá y se actualiza en todos los productos que lo usan.</div>'
@@ -509,23 +585,11 @@
       return out;
     }
 
-    out += '<div class="ing-list">';
-    state.ingredients.forEach(function(ing){
-      var perBase = pricePerBase(ing);
-      var tipoLabel = ing.tipo === 'peso' ? 'Peso' : (ing.tipo === 'volumen' ? 'Volumen' : 'Unidad');
-      var perBaseLabel = ing.tipo === 'peso' ? '/g' : (ing.tipo === 'volumen' ? '/ml' : '/u');
-      out += '<div class="ing-row">'
-        + '<span class="ing-tag">'+tipoLabel+'</span>'
-        + '<span class="ing-name">'+escapeHtml(ing.name)+'</span>'
-        + '<span class="ing-meta">'+money(ing.purchasePrice)+' cada '+ing.purchaseQty+' '+ing.purchaseUnit+'</span>'
-        + '<span class="ing-unit-price">'+money(perBase)+perBaseLabel+'</span>'
-        + '<span class="row-actions">'
-        +   '<button class="btn btn-ghost btn-sm" data-action="edit-ingredient" data-id="'+ing.id+'">Editar</button>'
-        +   '<button class="btn btn-danger btn-sm" data-action="delete-ingredient" data-id="'+ing.id+'">Eliminar</button>'
-        + '</span>'
-        + '</div>';
-    });
-    out += '</div>';
+    out += '<div class="toolbar" style="margin-bottom:14px;">'
+      + '<input type="text" id="ingredient-search" placeholder="Buscar ingredientes..." value="'+escapeHtml(state.ingredientSearch||'')+'" style="flex:1;min-width:160px;border:1px solid var(--line);border-radius:9px;padding:9px 12px;font-size:14px;background:#FCFBF7;">'
+      + '</div>';
+
+    out += '<div id="ingredients-list-container">' + renderIngredientsListHtml() + '</div>';
     return out;
   }
 
@@ -639,14 +703,18 @@
     var isEdit = !!data.id;
     var items = data.items || [];
     var mode = data.pricingMode || 'margin';
-    var costData = computeProductCostFromDraft(items);
+    var costData = computeProductCostFromDraft(items, data.id, data.extraCosts);
     var pricing = computePricingFromValue(mode, data.pricingValue, costData.total);
+    var cats = uniqueCategories();
     return '<div class="modal">'
       + '<div class="modal-header"><h2>'+(isEdit?'Editar producto':'Nuevo producto')+'</h2>'
       + '<button class="modal-close" data-action="close-modal">&times;</button></div>'
       + '<div class="modal-body" id="product-modal-body">'
       +   '<div class="field"><label>Nombre del producto</label><input type="text" id="prod-name" value="'+escapeHtml(data.name||'')+'" placeholder="Ej: Pizza muzzarella grande"></div>'
       +   '<div class="field"><label>Descripción corta (opcional)</label><input type="text" id="prod-desc" value="'+escapeHtml(data.description||'')+'" placeholder="Ej: Masa madre, 35cm"></div>'
+      +   '<div class="field"><label>Categoría (opcional)</label><input type="text" id="prod-category" list="prod-category-list" value="'+escapeHtml(data.category||'')+'" placeholder="Ej: Panificados">'
+      +     (cats.length ? ('<datalist id="prod-category-list">' + cats.map(function(c){ return '<option value="'+escapeHtml(c)+'">'; }).join('') + '</datalist>') : '')
+      +   '</div>'
       +   '<div class="field"><label>Foto (opcional)</label>'
       +     '<div class="photo-upload">'
       +       '<div class="photo-preview" id="photo-preview">'+(data.photo ? '<img src="'+data.photo+'">' : '📷')+'</div>'
@@ -662,6 +730,12 @@
       +       '<button type="button" class="btn btn-outline btn-sm" id="add-ing-row">+ Agregar ingrediente</button>'
       +       '<button type="button" class="btn btn-outline btn-sm" id="add-product-row">+ Agregar producto</button>'
       +     '</div>'
+      +   '</div>'
+      +   '<div>'
+      +     '<div class="section-label">Costos adicionales (opcional)</div>'
+      +     '<div class="helper" style="margin-bottom:8px;">Sumá gastos fijos de este producto que no son ingredientes, como gas, envase o flete.</div>'
+      +     '<div id="prod-extra-rows" style="display:flex;flex-direction:column;gap:8px;"></div>'
+      +     '<button type="button" class="btn btn-outline btn-sm" style="margin-top:8px;" id="add-extra-row">+ Agregar costo</button>'
       +   '</div>'
       +   '<div class="cost-summary"><span class="label">Costo total</span><span class="value" id="cost-total-display">'+money(costData.total)+'</span></div>'
       +   '<div>'
@@ -695,7 +769,7 @@
     });
   }
 
-  function computeProductCostFromDraft(items, editingId){
+  function computeProductCostFromDraft(items, editingId, extraCosts){
     var total = 0; var lines = [];
     var chain = editingId ? [editingId] : [];
     items.forEach(function(item){
@@ -716,6 +790,12 @@
         total += cost;
         lines.push({kind:'ingredient', ing:ing, cost:cost});
       }
+    });
+    (extraCosts||[]).forEach(function(ec){
+      var amt = parseFloat(ec.amount) || 0;
+      if(amt <= 0) return;
+      total += amt;
+      lines.push({kind:'extra', name: ec.name || '', cost: amt});
     });
     return {total:total, lines:lines};
   }
@@ -782,8 +862,24 @@
     }).join('');
   }
 
+  function renderExtraRows(draft){
+    var container = document.getElementById('prod-extra-rows');
+    if(!container) return;
+    if(!draft.extraCosts || draft.extraCosts.length === 0){
+      container.innerHTML = '<div class="helper">Sin costos adicionales cargados.</div>';
+      return;
+    }
+    container.innerHTML = draft.extraCosts.map(function(ec, idx){
+      return '<div class="prod-ing-row" data-extra-row="'+idx+'">'
+        + '<div class="field ingredient-field"><label>Nombre</label><input type="text" class="extra-name" data-extra-row="'+idx+'" value="'+escapeHtml(ec.name||'')+'" placeholder="Ej: Gas"></div>'
+        + '<div class="field qty-field"><label>Monto</label><input type="number" min="0" step="any" class="extra-amount" data-extra-row="'+idx+'" value="'+(ec.amount!=null?ec.amount:'')+'"></div>'
+        + '<button type="button" class="remove-row" data-remove-extra-row="'+idx+'">&times;</button>'
+        + '</div>';
+    }).join('');
+  }
+
   function refreshProductLiveCalc(draft){
-    var costData = computeProductCostFromDraft(draft.items, draft.id);
+    var costData = computeProductCostFromDraft(draft.items, draft.id, draft.extraCosts);
     document.getElementById('cost-total-display').textContent = money(costData.total);
     var pricing = computePricingFromValue(draft.pricingMode, draft.pricingValue, costData.total);
     var resultLabel = document.getElementById('result-label');
@@ -818,11 +914,48 @@
   function wireProductModal(data){
     var draft = data; // mutated in place while modal open
     if(!draft.items) draft.items = [];
+    if(!draft.extraCosts) draft.extraCosts = [];
     if(draft.items.length === 0 && state.ingredients.length > 0){
       draft.items.push({ kind:'ingredient', ingredientId: state.ingredients[0].id, qty:'', unit: unitsForTipo(state.ingredients[0].tipo)[0] });
     }
     renderIngRows(draft);
+    renderExtraRows(draft);
     refreshProductLiveCalc(draft);
+
+    document.getElementById('add-extra-row').addEventListener('click', function(){
+      draft.extraCosts.push({ name:'', amount:'' });
+      renderExtraRows(draft);
+      refreshProductLiveCalc(draft);
+      bindExtraRowEvents();
+    });
+
+    document.getElementById('prod-extra-rows').addEventListener('click', function(e){
+      var rm = e.target.getAttribute && e.target.getAttribute('data-remove-extra-row');
+      if(rm !== null && rm !== undefined && rm !== ''){
+        draft.extraCosts.splice(parseInt(rm,10),1);
+        renderExtraRows(draft);
+        refreshProductLiveCalc(draft);
+        bindExtraRowEvents();
+      }
+    });
+
+    function bindExtraRowEvents(){
+      document.querySelectorAll('.extra-name').forEach(function(inp){
+        inp.oninput = function(){
+          var idx = parseInt(inp.getAttribute('data-extra-row'),10);
+          draft.extraCosts[idx].name = inp.value;
+          refreshProductLiveCalc(draft);
+        };
+      });
+      document.querySelectorAll('.extra-amount').forEach(function(inp){
+        inp.oninput = function(){
+          var idx = parseInt(inp.getAttribute('data-extra-row'),10);
+          draft.extraCosts[idx].amount = inp.value;
+          refreshProductLiveCalc(draft);
+        };
+      });
+    }
+    bindExtraRowEvents();
 
     document.getElementById('add-ing-row').addEventListener('click', function(){
       if(state.ingredients.length === 0){ alert('Primero cargá algún ingrediente desde la pestaña "Ingredientes".'); return; }
@@ -944,17 +1077,25 @@
     var name = document.getElementById('prod-name').value.trim();
     if(!name){ alert('Ponele un nombre al producto.'); return; }
     var description = document.getElementById('prod-desc').value.trim();
+    var category = document.getElementById('prod-category').value.trim();
     var items = draft.items.filter(function(it){
       var kind = it.kind || 'ingredient';
       if(kind === 'product') return it.productId && parseFloat(it.qty) > 0;
       return it.ingredientId && parseFloat(it.qty) > 0;
     });
+    var extraCosts = (draft.extraCosts||[]).filter(function(ec){
+      return (ec.name||'').trim() && parseFloat(ec.amount) > 0;
+    }).map(function(ec){
+      return { name: ec.name.trim(), amount: parseFloat(ec.amount) };
+    });
     var product = {
       id: id || uid(),
       name: name,
       description: description,
+      category: category,
       photo: draft.photo || null,
       items: items,
+      extraCosts: extraCosts,
       pricingMode: draft.pricingMode || 'margin',
       pricingValue: draft.pricingValue || 0
     };
@@ -977,6 +1118,7 @@
       + '<button class="modal-close" data-action="close-modal">&times;</button></div>'
       + '<div class="modal-body">'
       +   (product.photo ? '<div class="detail-photo"><img src="'+product.photo+'"></div>' : '')
+      +   (product.category ? '<span class="ing-tag">'+escapeHtml(product.category)+'</span>' : '')
       +   (product.description ? '<div class="helper" style="font-size:14px;color:var(--ink);">'+escapeHtml(product.description)+'</div>' : '')
       +   '<div>'
       +     '<div class="section-label">Ingredientes y productos</div>'
@@ -985,6 +1127,9 @@
                 if(l.kind === 'product'){
                   return '<div class="detail-ing-item"><span class="qname">'+escapeHtml(l.product.name)+' <span class="qamt">(x'+l.qty+', producto)</span></span><span class="qcost">'+money(l.cost)+'</span></div>'
                     + (l.circular ? '<div class="helper" style="color:var(--rust);padding:0 0 6px;">⚠ Referencia circular: revisá los componentes de este producto.</div>' : '');
+                }
+                if(l.kind === 'extra'){
+                  return '<div class="detail-ing-item"><span class="qname">'+escapeHtml(l.name)+' <span class="qamt">(costo fijo)</span></span><span class="qcost">'+money(l.cost)+'</span></div>';
                 }
                 return '<div class="detail-ing-item"><span class="qname">'+escapeHtml(l.ing.name)+' <span class="qamt">('+l.qty+' '+l.unit+')</span></span><span class="qcost">'+money(l.cost)+'</span></div>';
               }).join('') : '<div class="helper" style="padding:10px 0;">Sin ingredientes ni productos cargados.</div>')
@@ -1009,6 +1154,15 @@
       + '<div class="modal-header"><h2>Tu perfil</h2><button class="modal-close" data-action="close-modal">&times;</button></div>'
       + '<div class="modal-body">'
       +   '<div class="field"><label>Nombre</label><input type="text" id="edit-profile-name" value="'+escapeHtml(state.profile.name)+'"></div>'
+      +   '<div style="border-top:1px solid var(--line-soft);padding-top:16px;">'
+      +     '<div class="section-label">Respaldo de datos</div>'
+      +     '<div class="helper" style="margin-bottom:10px;">Guardá una copia de tus ingredientes y productos, o restaurala si perdiste los datos.</div>'
+      +     '<div style="display:flex;gap:8px;flex-wrap:wrap;">'
+      +       '<button type="button" class="btn btn-outline btn-sm" data-action="export-backup">⬇ Descargar respaldo</button>'
+      +       '<button type="button" class="btn btn-outline btn-sm" id="import-backup-btn">⬆ Restaurar respaldo</button>'
+      +       '<input type="file" id="import-backup-input" accept="application/json" style="display:none;">'
+      +     '</div>'
+      +   '</div>'
       + '</div>'
       + '<div class="modal-footer">'
       +   '<button class="btn btn-ghost" data-action="close-modal">Cancelar</button>'
@@ -1022,7 +1176,21 @@
       wireIngredientModalLive();
     } else if(state.modal.type === 'product'){
       wireProductModal(state.modal.data);
+    } else if(state.modal.type === 'profile'){
+      wireProfileModalExtra();
     }
+  }
+
+  function wireProfileModalExtra(){
+    var importBtn = document.getElementById('import-backup-btn');
+    var importInput = document.getElementById('import-backup-input');
+    if(!importBtn || !importInput) return;
+    importBtn.addEventListener('click', function(){ importInput.click(); });
+    importInput.addEventListener('change', function(){
+      var file = importInput.files[0];
+      if(!file) return;
+      importBackupFromFile(file);
+    });
   }
 
   // ---------------- EVENTS ----------------
@@ -1043,7 +1211,7 @@
         }
       }
       else if(action === 'save-ingredient'){ saveIngredientFromModal(id || null); }
-      else if(action === 'open-product-modal'){ state.modal = {type:'product', data:{ pricingMode:'margin', items:[] }}; render(); }
+      else if(action === 'open-product-modal'){ state.modal = {type:'product', data:{ pricingMode:'margin', items:[], extraCosts:[] }}; render(); }
       else if(action === 'open-product-detail'){ state.modal = {type:'productDetail', data: state.products.find(function(p){return p.id===id;})}; render(); }
       else if(action === 'edit-product'){
         var p = state.products.find(function(pp){ return pp.id === id; });
@@ -1070,7 +1238,77 @@
         if(name){ state.profile.name = name; saveState(); }
         closeModal();
       }
+      else if(action === 'export-backup'){ exportBackup(); }
     };
+
+    var prodSearchInput = document.getElementById('product-search');
+    if(prodSearchInput){
+      prodSearchInput.addEventListener('input', function(){
+        state.productSearch = prodSearchInput.value;
+        var c = document.getElementById('products-grid-container');
+        if(c) c.innerHTML = renderProductsGridHtml();
+      });
+    }
+    var prodCatFilter = document.getElementById('product-category-filter');
+    if(prodCatFilter){
+      prodCatFilter.addEventListener('change', function(){
+        state.productCategoryFilter = prodCatFilter.value;
+        var c = document.getElementById('products-grid-container');
+        if(c) c.innerHTML = renderProductsGridHtml();
+      });
+    }
+    var ingSearchInput = document.getElementById('ingredient-search');
+    if(ingSearchInput){
+      ingSearchInput.addEventListener('input', function(){
+        state.ingredientSearch = ingSearchInput.value;
+        var c = document.getElementById('ingredients-list-container');
+        if(c) c.innerHTML = renderIngredientsListHtml();
+      });
+    }
+  }
+
+  function exportBackup(){
+    var payload = {
+      profile: state.profile,
+      ingredients: state.ingredients,
+      products: state.products,
+      exportedAt: new Date().toISOString()
+    };
+    var blob = new Blob([JSON.stringify(payload, null, 2)], {type:'application/json'});
+    var url = URL.createObjectURL(blob);
+    var a = document.createElement('a');
+    var stamp = new Date().toISOString().slice(0,10);
+    a.href = url;
+    a.download = 'costeo-respaldo-' + stamp + '.json';
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    setTimeout(function(){ URL.revokeObjectURL(url); }, 1000);
+  }
+
+  function importBackupFromFile(file){
+    var reader = new FileReader();
+    reader.onload = function(){
+      var data;
+      try{
+        data = JSON.parse(reader.result);
+      }catch(e){
+        alert('No se pudo leer el archivo. Asegurate de elegir un respaldo válido de Costeo.');
+        return;
+      }
+      if(!data || !Array.isArray(data.ingredients) || !Array.isArray(data.products)){
+        alert('Ese archivo no parece un respaldo válido de Costeo.');
+        return;
+      }
+      if(!confirm('Esto va a reemplazar todos los datos actuales de la app por los del respaldo. ¿Continuar?')) return;
+      state.profile = data.profile || state.profile;
+      state.ingredients = data.ingredients;
+      state.products = data.products;
+      saveState();
+      closeModal();
+      alert('Respaldo restaurado correctamente.');
+    };
+    reader.readAsText(file);
   }
 
   render();
